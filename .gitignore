@@ -1,0 +1,20 @@
+# Build output
+rpmbuild/
+*.rpm
+*.log
+
+# Python
+__pycache__/
+*.pyc
+
+# Sensor frames from tuning/debugging may contain fingerprint images — never commit them
+*.pgm
+*.png.raw
+dump/
+
+# Editors / OS
+*~
+*.swp
+.vscode/
+.idea/
+.DS_Store

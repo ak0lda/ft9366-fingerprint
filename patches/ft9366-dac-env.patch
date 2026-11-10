@@ -1,0 +1,50 @@
+--- a/libfprint/drivers/ft9366.c
++++ b/libfprint/drivers/ft9366.c
+@@ -72,6 +72,29 @@
+ /* values the vendor driver settled on for this sensor */
+ #define FT9366_FDT_DAC        0x1a
+ #define FT9366_IMG_DAC        0x37
++
++/* The usable imaging DAC window differs per unit (see upstream issue #3).
++ * FT9366_IMG_DAC=0xNN overrides the compiled default, within 0x28-0x58. */
++static guint8
++ft9366_img_dac (void)
++{
++  static gint dac = -1;
++
++  if (dac < 0)
++    {
++      const char *env = g_getenv ("FT9366_IMG_DAC");
++      char *end = NULL;
++      guint64 v = env ? g_ascii_strtoull (env, &end, 0) : 0;
++
++      dac = FT9366_IMG_DAC;
++      if (env && *env && end && *end == '\0' && v >= 0x28 && v <= 0x58)
++        dac = (gint) v;
++      else if (env)
++        g_warning ("ignoring invalid FT9366_IMG_DAC=%s", env);
++      g_info ("imaging DAC 0x%02x", dac);
++    }
++  return (guint8) dac;
++}
+ #define FT9366_FDT_BASE_DROP  31   /* baseline = empty-sensor measurement - this */
+ #define FT9366_MAX_REINITS    3    /* sensor recalibrations per touch for a bad baseline */
+ #define FT9366_FDT_STABLE     8    /* measurement noise: readings this close are "unchanged" */
+@@ -421,7 +444,7 @@
+       memset (t->buffer, 0, 24);
+       t->buffer[0] = 0x4b;
+       t->buffer[2] = FT9366_FDT_DAC;
+-      t->buffer[4] = FT9366_IMG_DAC;
++      t->buffer[4] = ft9366_img_dac ();
+       t->buffer[6] = 0xc8;
+       for (guint i = 0; i < 4; i++)
+         {
+@@ -503,7 +526,7 @@
+     case OP_DAC:
+       FP_WRITE_UINT16_BE (&t->buffer[2], FT9366_REG_DAC);
+       FP_WRITE_UINT16_BE (&t->buffer[4], 1);
+-      FP_WRITE_UINT16_BE (&t->buffer[6], 0xfc80 | op->val);
++      FP_WRITE_UINT16_BE (&t->buffer[6], 0xfc80 | (op->val == FT9366_IMG_DAC ? ft9366_img_dac () : op->val));
+       break;
+ 
+     case OP_WR16:

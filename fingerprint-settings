@@ -1,0 +1,619 @@
+#!/usr/bin/python3 -I
+# SPDX-License-Identifier: GPL-3.0-or-later
+# «Отпечатки пальцев» — запись отпечатков и выбор, где ими входить.
+# Работает с любым сканером fprintd; для FocalTech FT9366 показывает и подбор усиления.
+import math
+import os
+import pwd
+import re
+import subprocess
+
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gdk, Gio, GLib, Graphene, Gsk, Gtk  # noqa: E402
+
+APP_ID = "org.local.FingerprintSettings"
+HELPER = "/usr/local/libexec/fingerprint-settings-helper"
+TUNER = "/usr/local/sbin/ft9366-tune-dac"
+DROPIN = "/etc/systemd/system/fprintd.service.d/ft9366-dac.conf"
+FP_BUS = "net.reactivated.Fprint"
+
+FINGERS = [
+    ("right-index-finger", "Правый указательный"),
+    ("right-thumb", "Правый большой"),
+    ("right-middle-finger", "Правый средний"),
+    ("right-ring-finger", "Правый безымянный"),
+    ("right-little-finger", "Правый мизинец"),
+    ("left-index-finger", "Левый указательный"),
+    ("left-thumb", "Левый большой"),
+    ("left-middle-finger", "Левый средний"),
+    ("left-ring-finger", "Левый безымянный"),
+    ("left-little-finger", "Левый мизинец"),
+]
+FINGER_NAME = dict(FINGERS)
+
+ENROLL_MSG = {
+    "enroll-stage-passed": "Отлично. Уберите палец и приложите снова, чуть сдвинув",
+    "enroll-retry-scan": "Не получилось — приложите ещё раз",
+    "enroll-swipe-too-short": "Не получилось — приложите ещё раз",
+    "enroll-finger-not-centered": "Палец не по центру — приложите ещё раз",
+    "enroll-remove-and-retry": "Уберите палец и приложите ещё раз",
+    "enroll-duplicate": "Этот палец уже записан",
+    "enroll-failed": "Запись не удалась",
+    "enroll-data-full": "Память сканера заполнена",
+    "enroll-disconnected": "Сканер отключился",
+    "enroll-unknown-error": "Неизвестная ошибка сканера",
+}
+VERIFY_MSG = {
+    "verify-match": "Совпало ✓",
+    "verify-no-match": "Не совпало",
+    "verify-retry-scan": "Приложите ещё раз",
+    "verify-swipe-too-short": "Приложите ещё раз",
+    "verify-finger-not-centered": "Палец не по центру — ещё раз",
+    "verify-remove-and-retry": "Уберите палец и приложите ещё раз",
+    "verify-disconnected": "Сканер отключился",
+    "verify-unknown-error": "Ошибка сканера",
+}
+
+
+# ---------- fprintd ----------------------------------------------------------
+
+class Fprint:
+    def __init__(self):
+        self.bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+        self.user = pwd.getpwuid(os.getuid()).pw_name
+        self.dev = None
+
+    def connect(self):
+        mgr = Gio.DBusProxy.new_sync(self.bus, 0, None, FP_BUS, "/net/reactivated/Fprint/Manager",
+                                     FP_BUS + ".Manager", None)
+        path = mgr.call_sync("GetDefaultDevice", None, 0, -1, None).unpack()[0]
+        self.dev = Gio.DBusProxy.new_sync(self.bus, 0, None, FP_BUS, path, FP_BUS + ".Device", None)
+        return self.dev
+
+    def prop(self, name, default=None):
+        v = self.dev.get_cached_property(name) if self.dev else None
+        return v.unpack() if v is not None else default
+
+    def _call(self, method, args=None, timeout=-1):
+        return self.dev.call_sync(method, args, 0, timeout, None)
+
+    def enrolled(self):
+        try:
+            return list(self._call("ListEnrolledFingers", GLib.Variant("(s)", (self.user,))).unpack()[0])
+        except GLib.Error as e:
+            if "NoEnrolledPrints" in e.message:
+                return []
+            raise
+
+    def claim(self):
+        self._call("Claim", GLib.Variant("(s)", ("",)))
+
+    def release(self):
+        try:
+            self._call("Release")
+        except GLib.Error:
+            pass
+
+    def delete(self, finger):
+        self.claim()
+        try:
+            self._call("DeleteEnrolledFinger", GLib.Variant("(s)", (finger,)))
+        finally:
+            self.release()
+
+
+# ---------- системные настройки (чтение без root) ----------------------------
+
+def _read(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def zone_terminal():
+    return re.search(r"^auth\s+include\s+system-auth\s*$", _read("/etc/pam.d/sudo"), re.M) is not None
+
+
+def zone_polkit():
+    own = _read("/etc/pam.d/polkit-1")
+    return not ("fingerprint-settings" in own and "password-auth" in own)
+
+
+def zone_login():
+    return "enable-fingerprint-authentication=false" not in _read("/etc/dconf/db/gdm.d/95-fingerprint-settings")
+
+
+def authselect_ok():
+    try:
+        out = subprocess.run(["authselect", "current"], capture_output=True, text=True, timeout=5).stdout
+        return "with-fingerprint" in out
+    except (OSError, subprocess.SubprocessError):
+        return True
+
+
+def current_dac():
+    m = re.search(r"FT9366_IMG_DAC=(0x[0-9a-fA-F]+)", _read(DROPIN))
+    return m.group(1) if m else None
+
+
+def libfprint_version():
+    try:
+        return subprocess.run(["rpm", "-q", "libfprint"], capture_output=True, text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+# ---------- диалог записи ----------------------------------------------------
+
+def _accent_rgba():
+    try:
+        return Adw.StyleManager.get_default().get_accent_color_rgba()
+    except (AttributeError, TypeError):
+        c = Gdk.RGBA()
+        c.parse("#3584e4")
+        return c
+
+
+class Ring(Gtk.Widget):
+    """Рисует только кольцо; значок кладётся сверху через Gtk.Overlay."""
+    SIZE, WIDTH = 176, 10
+
+    def __init__(self):
+        super().__init__()
+        self.value = 0.0
+        self.state = "normal"          # normal | success | error
+        self.set_size_request(self.SIZE, self.SIZE)
+        self.anim = None
+
+    def set_value(self, value, animate=True):
+        value = max(0.0, min(1.0, value))
+        if self.anim:
+            self.anim.skip()
+        if not animate:
+            self.value = value
+            self.queue_draw()
+            return
+        target = Adw.CallbackAnimationTarget.new(self._anim_step)
+        self.anim = Adw.TimedAnimation.new(self, self.value, value, 300, target)
+        self.anim.set_easing(Adw.Easing.EASE_OUT_CUBIC)
+        self.anim.play()
+
+    def _anim_step(self, v):
+        self.value = v
+        self.queue_draw()
+
+    def set_state(self, state):
+        self.state = state
+        self.queue_draw()
+
+    def do_snapshot(self, snap):
+        w, h = self.get_width(), self.get_height()
+        r = min(w, h) / 2 - self.WIDTH / 2 - 1
+        cx, cy = w / 2, h / 2
+        stroke = Gsk.Stroke.new(self.WIDTH)
+        stroke.set_line_cap(Gsk.LineCap.ROUND)
+
+        track = self.get_color()
+        track.alpha = 0.12
+        pb = Gsk.PathBuilder.new()
+        pb.add_circle(Graphene.Point().init(cx, cy), r)
+        snap.append_stroke(pb.to_path(), stroke, track)
+
+        if self.value > 0.001:
+            color = _accent_rgba()
+            if self.state == "error":
+                color = Gdk.RGBA()
+                color.parse("#e01b24")
+            elif self.state == "success":
+                color = Gdk.RGBA()
+                color.parse("#2ec27e")
+            pb = Gsk.PathBuilder.new()
+            if self.value >= 0.999:
+                pb.add_circle(Graphene.Point().init(cx, cy), r)
+            else:
+                a0 = -math.pi / 2
+                a1 = a0 + 2 * math.pi * self.value
+                pb.move_to(cx + r * math.cos(a0), cy + r * math.sin(a0))
+                pb.svg_arc_to(r, r, 0, self.value > 0.5, True, cx + r * math.cos(a1), cy + r * math.sin(a1))
+            snap.append_stroke(pb.to_path(), stroke, color)
+
+
+class ProgressRing(Gtk.Overlay):
+    """Кольцо прогресса вокруг значка отпечатка (как в «Настройках» GNOME)."""
+
+    ICONS = {"normal": "auth-fingerprint-symbolic", "success": "object-select-symbolic",
+             "error": "dialog-warning-symbolic"}
+
+    def __init__(self):
+        super().__init__(halign=Gtk.Align.CENTER)
+        self.ring = Ring()
+        self.set_child(self.ring)
+        self.icon = Gtk.Image(icon_name=self.ICONS["normal"], pixel_size=80, css_classes=["dim-label"],
+                              halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER)
+        self.add_overlay(self.icon)
+
+    @property
+    def value(self):
+        return self.ring.value
+
+    def set_value(self, value, animate=True):
+        self.ring.set_value(value, animate)
+
+    def set_state(self, state):
+        self.ring.set_state(state)
+        self.icon.set_from_icon_name(self.ICONS[state])
+        self.icon.set_css_classes({"normal": ["accent"], "success": ["success"], "error": ["error"]}[state])
+
+
+class EnrollDialog(Adw.Dialog):
+    RETRY = {"enroll-retry-scan", "enroll-swipe-too-short", "enroll-finger-not-centered",
+             "enroll-remove-and-retry"}
+
+    def __init__(self, fp, finger, on_done):
+        super().__init__(title="Запись отпечатка", content_width=400)
+        self.fp, self.finger, self.on_done = fp, finger, on_done
+        self.stages = max(1, int(fp.prop("num-enroll-stages", 10) or 10))
+        self.passed = 0
+        self.sig = None
+        self.finished = False
+
+        tv = Adw.ToolbarView()
+        tv.add_top_bar(Adw.HeaderBar())
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
+                      margin_top=12, margin_bottom=12, margin_start=32, margin_end=32)
+        self.ring = ProgressRing()
+        self.ring.set_margin_bottom(18)
+        box.append(self.ring)
+        box.append(Gtk.Label(label=FINGER_NAME.get(finger, finger), css_classes=["title-2"]))
+        self.counter = Gtk.Label(label=f"0 из {self.stages}", css_classes=["title-4", "numeric", "dim-label"])
+        box.append(self.counter)
+        self.msg = Gtk.Label(label="Приложите палец к сканеру на секунду и уберите.\n"
+                                   "Касайтесь легко — сканер в кнопке питания.",
+                             wrap=True, justify=Gtk.Justification.CENTER, lines=2,
+                             height_request=72, valign=Gtk.Align.START, margin_top=6)
+        box.append(self.msg)
+        tv.set_content(box)
+
+        self.button = Gtk.Button(label="Отмена", halign=Gtk.Align.CENTER, css_classes=["pill"],
+                                 margin_top=6, margin_bottom=24)
+        self.button.connect("clicked", lambda *_: self.close())
+        tv.add_bottom_bar(self.button)
+
+        self.set_child(tv)
+        self.connect("closed", self._on_closed)
+
+    def _say(self, text, kind=None):
+        self.msg.set_label(text)
+        self.msg.set_css_classes([kind] if kind else [])
+
+    def start(self):
+        try:
+            self.fp.claim()
+            self.sig = self.fp.dev.connect("g-signal", self._on_signal)
+            self.fp._call("EnrollStart", GLib.Variant("(s)", (self.finger,)))
+            self.ring.set_state("normal")
+        except GLib.Error as e:
+            self._finish("Не удалось начать запись: " + e.message.split(":")[-1].strip(), ok=False)
+
+    def _on_signal(self, _proxy, _sender, name, params):
+        if name != "EnrollStatus":
+            return
+        result, done = params.unpack()
+        if result == "enroll-completed":
+            self.passed = self.stages
+            self.counter.set_label(f"{self.stages} из {self.stages}")
+            self.ring.set_value(1.0)
+            self._finish("Отпечаток записан", ok=True)
+            return
+        if result == "enroll-stage-passed":
+            self.passed = min(self.passed + 1, self.stages)
+            self.ring.set_value(self.passed / self.stages)
+            self.counter.set_label(f"{self.passed} из {self.stages}")
+            self._say(ENROLL_MSG[result])
+        elif result in self.RETRY:
+            self._say(ENROLL_MSG.get(result, result), "warning")
+        else:
+            self._say(ENROLL_MSG.get(result, result), "error")
+        if done:
+            self._finish(ENROLL_MSG.get(result, result), ok=False)
+
+    def _finish(self, text, ok):
+        if self.finished:
+            return
+        self.finished = True
+        self._stop()
+        self.ring.set_state("success" if ok else "error")
+        if not ok and self.ring.value < 0.001:
+            self.ring.set_value(1.0, animate=False)
+        self._say(text, "success" if ok else "error")
+        self.button.set_label("Готово" if ok else "Закрыть")
+        self.button.add_css_class("suggested-action")
+        self.on_done()
+        if ok:
+            GLib.timeout_add(1500, lambda: (self.close(), False)[1])
+
+    def _stop(self):
+        if self.sig:
+            self.fp.dev.disconnect(self.sig)
+            self.sig = None
+        try:
+            self.fp._call("EnrollStop")
+        except GLib.Error:
+            pass
+        self.fp.release()
+
+    def _on_closed(self, *_):
+        if not self.finished:
+            self.finished = True
+            self._stop()
+            self.on_done()
+
+
+# ---------- главное окно -----------------------------------------------------
+
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Отпечатки пальцев", default_width=640, default_height=760)
+        self.fp = Fprint()
+        self.busy = False
+        self.verify_sig = None
+
+        self.toasts = Adw.ToastOverlay()
+        tv = Adw.ToolbarView()
+        hb = Adw.HeaderBar()
+        refresh = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Обновить")
+        refresh.connect("clicked", lambda *_: self.refresh())
+        hb.pack_start(refresh)
+        tv.add_top_bar(hb)
+        self.banner = Adw.Banner(title="Отпечатки отключены в системе (authselect without with-fingerprint)")
+        tv.add_top_bar(self.banner)
+
+        self.page = Adw.PreferencesPage()
+        tv.set_content(self.page)
+        self.toasts.set_child(tv)
+        self.set_content(self.toasts)
+
+        # --- отпечатки
+        self.g_fingers = Adw.PreferencesGroup(title="Отпечатки",
+                                              description="Записанные пальцы вашей учётной записи")
+        self.add_btn = Gtk.Button(label="Добавить", valign=Gtk.Align.CENTER, css_classes=["suggested-action"])
+        self.add_btn.connect("clicked", self.on_add)
+        self.g_fingers.set_header_suffix(self.add_btn)
+        self.page.add(self.g_fingers)
+        self.finger_rows = []
+
+        self.verify_row = Adw.ActionRow(title="Проверить отпечаток", subtitle="Нажмите «Проверить» и приложите палец")
+        self.verify_btn = Gtk.Button(label="Проверить", valign=Gtk.Align.CENTER)
+        self.verify_btn.connect("clicked", self.on_verify)
+        self.verify_row.add_suffix(self.verify_btn)
+
+        # --- где применять
+        g = Adw.PreferencesGroup(title="Где входить по отпечатку",
+                                 description="Пароль остаётся запасным вариантом везде")
+        self.sw_login = self._switch(g, "Вход в систему", "Экран входа после включения или выхода",
+                                     "system-users-symbolic", lambda on: self.set_root_zone("login", on))
+        self.sw_lock = self._switch(g, "Разблокировка экрана", "Экран блокировки GNOME",
+                                    "system-lock-screen-symbolic", self.set_lock)
+        self.sw_term = self._switch(g, "Терминал", "sudo, sudo -i и su",
+                                    "utilities-terminal-symbolic", lambda on: self.set_root_zone("terminal", on))
+        self.sw_polkit = self._switch(g, "Запросы прав администратора",
+                                      "Окна «Требуется аутентификация» в приложениях",
+                                      "security-high-symbolic", lambda on: self.set_root_zone("polkit", on))
+        self.page.add(g)
+
+        # --- сканер
+        self.g_dev = Adw.PreferencesGroup(title="Сканер")
+        self.dev_row = Adw.ActionRow(title="Сканер", icon_name="auth-fingerprint-symbolic")
+        self.g_dev.add(self.dev_row)
+        self.dac_row = Adw.ActionRow(title="Усиление изображения",
+                                     subtitle="Подбирается под конкретный экземпляр сканера FT9366")
+        tune = Gtk.Button(label="Подобрать заново", valign=Gtk.Align.CENTER)
+        tune.connect("clicked", self.on_tune)
+        self.dac_row.add_suffix(tune)
+        self.g_dev.add(self.dac_row)
+        self.page.add(self.g_dev)
+
+        self.lock_settings = Gio.Settings.new("org.gnome.login-screen")
+        self.refresh()
+
+    # helpers
+    def _switch(self, group, title, subtitle, icon, handler):
+        row = Adw.SwitchRow(title=title, subtitle=subtitle, icon_name=icon)
+        row._handler = handler
+        row.connect("notify::active", self._on_switch)
+        group.add(row)
+        return row
+
+    def _on_switch(self, row, _pspec):
+        if self.busy:
+            return
+        row._handler(row.get_active())
+
+    def _set_quiet(self, row, value):
+        self.busy = True
+        row.set_active(value)
+        self.busy = False
+
+    def toast(self, text):
+        self.toasts.add_toast(Adw.Toast(title=text, timeout=3))
+
+    # data
+    def refresh(self):
+        self._set_quiet(self.sw_login, zone_login())
+        self._set_quiet(self.sw_lock, self.lock_settings.get_boolean("enable-fingerprint-authentication"))
+        self._set_quiet(self.sw_term, zone_terminal())
+        self._set_quiet(self.sw_polkit, zone_polkit())
+        self.banner.set_revealed(not authselect_ok())
+
+        for r in self.finger_rows:
+            self.g_fingers.remove(r)
+        self.finger_rows = []
+
+        try:
+            self.fp.connect()
+            name = self.fp.prop("name", "сканер")
+            self.dev_row.set_subtitle(f"{name}\n{libfprint_version()}")
+            fingers = self.fp.enrolled()
+            self.add_btn.set_sensitive(True)
+        except GLib.Error as e:
+            self.dev_row.set_subtitle("Сканер не найден: " + e.message.split(":")[-1].strip())
+            fingers = []
+            self.add_btn.set_sensitive(False)
+
+        is_ft = "FT9366" in (self.fp.prop("name", "") or "")
+        self.dac_row.set_visible(is_ft)
+        if is_ft:
+            dac = current_dac()
+            self.dac_row.set_title(f"Усиление изображения: {dac}" if dac else "Усиление изображения: не подобрано")
+
+        n = len(fingers)
+        word = "палец" if n % 10 == 1 and n % 100 != 11 else \
+               "пальца" if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14 else "пальцев"
+        self.g_fingers.set_description(f"Записано {n} {word} для {self.fp.user}" if n
+                                       else "Запишите хотя бы один палец, чтобы входить по отпечатку")
+        if not fingers:
+            r = Adw.ActionRow(title="Нет записанных отпечатков", subtitle="Нажмите «Добавить»")
+            self._add_finger_row(r)
+        for f in fingers:
+            r = Adw.ActionRow(title=FINGER_NAME.get(f, f), icon_name="auth-fingerprint-symbolic")
+            b = Gtk.Button(icon_name="user-trash-symbolic", valign=Gtk.Align.CENTER,
+                           tooltip_text="Удалить", css_classes=["flat"])
+            b.connect("clicked", self.on_delete, f)
+            r.add_suffix(b)
+            self._add_finger_row(r)
+        if fingers:
+            self._add_finger_row(self.verify_row)
+
+    def _add_finger_row(self, row):
+        self.g_fingers.add(row)
+        self.finger_rows.append(row)
+
+    # fingers
+    def on_add(self, _btn):
+        try:
+            taken = set(self.fp.enrolled())
+        except GLib.Error:
+            taken = set()
+        free = [(k, v) for k, v in FINGERS if k not in taken]
+        if not free:
+            self.toast("Записаны все пальцы")
+            return
+        dlg = Adw.AlertDialog(heading="Какой палец записать?",
+                              body="Понадобится около 20 касаний. Прикладывайте палец легко и каждый раз "
+                                   "чуть сдвигайте.")
+        dd = Gtk.DropDown.new_from_strings([v for _, v in free])
+        dlg.set_extra_child(dd)
+        dlg.add_response("cancel", "Отмена")
+        dlg.add_response("go", "Начать")
+        dlg.set_response_appearance("go", Adw.ResponseAppearance.SUGGESTED)
+
+        def on_resp(_d, resp):
+            if resp == "go":
+                finger = free[dd.get_selected()][0]
+                ed = EnrollDialog(self.fp, finger, self.refresh)
+                ed.present(self)
+                ed.start()
+        dlg.connect("response", on_resp)
+        dlg.present(self)
+
+    def on_delete(self, _btn, finger):
+        dlg = Adw.AlertDialog(heading="Удалить отпечаток?", body=FINGER_NAME.get(finger, finger))
+        dlg.add_response("cancel", "Отмена")
+        dlg.add_response("del", "Удалить")
+        dlg.set_response_appearance("del", Adw.ResponseAppearance.DESTRUCTIVE)
+
+        def on_resp(_d, resp):
+            if resp != "del":
+                return
+            try:
+                self.fp.delete(finger)
+                self.toast("Отпечаток удалён")
+            except GLib.Error as e:
+                self.toast("Не удалось удалить: " + e.message.split(":")[-1].strip())
+            self.refresh()
+        dlg.connect("response", on_resp)
+        dlg.present(self)
+
+    def on_verify(self, _btn):
+        if self.verify_sig:
+            return
+        try:
+            self.fp.claim()
+            self.verify_sig = self.fp.dev.connect("g-signal", self._on_verify_signal)
+            self.fp._call("VerifyStart", GLib.Variant("(s)", ("any",)))
+            self.verify_row.set_subtitle("Приложите палец…")
+            self.verify_btn.set_sensitive(False)
+        except GLib.Error as e:
+            self._verify_end()
+            self.verify_row.set_subtitle("Ошибка: " + e.message.split(":")[-1].strip())
+
+    def _on_verify_signal(self, _p, _s, name, params):
+        if name != "VerifyStatus":
+            return
+        result, done = params.unpack()
+        self.verify_row.set_subtitle(VERIFY_MSG.get(result, result))
+        if done:
+            self._verify_end()
+
+    def _verify_end(self):
+        if self.verify_sig:
+            self.fp.dev.disconnect(self.verify_sig)
+            self.verify_sig = None
+        try:
+            self.fp._call("VerifyStop")
+        except GLib.Error:
+            pass
+        self.fp.release()
+        self.verify_btn.set_sensitive(True)
+
+    # zones
+    def set_lock(self, on):
+        self.lock_settings.set_boolean("enable-fingerprint-authentication", on)
+        self.toast("Разблокировка по отпечатку " + ("включена" if on else "выключена"))
+
+    def set_root_zone(self, zone, on):
+        row = {"login": self.sw_login, "terminal": self.sw_term, "polkit": self.sw_polkit}[zone]
+        row.set_sensitive(False)
+        proc = Gio.Subprocess.new(["pkexec", HELPER, zone, "on" if on else "off"],
+                                  Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_MERGE)
+
+        def done(p, res):
+            try:
+                _ok, out, _err = p.communicate_utf8_finish(res)
+            except GLib.Error as e:
+                out = e.message
+            row.set_sensitive(True)
+            if p.get_successful():
+                self.toast(f"{row.get_title()}: отпечаток " + ("включён" if on else "выключен"))
+            else:
+                msg = (out or "").strip().splitlines()[-1:] or ["отменено"]
+                self.toast("Не изменено: " + msg[0])
+            self.refresh()
+        proc.communicate_utf8_async(None, None, done)
+
+    # scanner
+    def on_tune(self, _btn):
+        cmd = f"sudo {TUNER} {self.fp.user}; echo; read -r -p 'Нажмите Enter, чтобы закрыть' _"
+        try:
+            Gio.Subprocess.new(["ptyxis", "--new-window", "--", "bash", "-c", cmd], Gio.SubprocessFlags.NONE)
+            self.toast("Подбор усиления открыт в терминале. После него нажмите «Обновить».")
+        except GLib.Error as e:
+            self.toast("Не удалось открыть терминал: " + e.message)
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+
+    def do_activate(self):
+        win = self.props.active_window or Window(self)
+        win.present()
+
+
+if __name__ == "__main__":
+    raise SystemExit(App().run(None))

@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# ft9366-tune-dac — подбор усиления изображения (imaging DAC) сканера FocalTech FT9366 (2808:a658).
+#
+# У каждого экземпляра сканера свой рабочий диапазон усиления (несколько шагов DAC).
+# При неверном значении кадр получается чёрным или пересвеченным, и палец не распознаётся.
+# Скрипт снимает кадр при разных значениях (по одному касанию), ищет то, при котором
+# пустой сканер даёт среднюю яркость около 2000 из 4095, и прописывает его службе fprintd.
+#
+# Запуск:  sudo ft9366-tune-dac [пользователь]
+set -euo pipefail
+[[ $EUID -eq 0 ]] || exec sudo "$0" "$@"
+
+TARGET_USER=${1:-${SUDO_USER:-}}
+[[ -n $TARGET_USER && $TARGET_USER != root ]] || { echo "Укажите пользователя: sudo $0 <имя>"; exit 1; }
+DROPIN=/etc/systemd/system/fprintd.service.d/ft9366-dac.conf
+DAC_MIN=0x28 DAC_MAX=0x58 TARGET=2000 MAX_TRIES=7
+
+WORK=$(mktemp -d /run/ft9366-tune.XXXXXX)   # кадры с пальцем — только в RAM и только для root
+chmod 700 "$WORK"
+
+stop_fprintd() {
+  systemctl stop fprintd.service 2>/dev/null || true
+  pkill -x fprintd-enroll 2>/dev/null || true
+  pkill -x fprintd 2>/dev/null || true
+  for _ in $(seq 1 20); do pgrep -x fprintd >/dev/null || return 0; sleep 0.5; done
+  pkill -9 -x fprintd 2>/dev/null || true
+}
+cleanup() { stop_fprintd; rm -rf "$WORK"; }
+trap cleanup EXIT
+
+current_dac() {
+  sed -nE 's/^Environment=FT9366_IMG_DAC=(0x[0-9a-fA-F]+).*/\1/p' "$DROPIN" 2>/dev/null | tail -1
+}
+
+# Снять один кадр при усилении $1. Печатает: "<фон, среднее> <фон испорчен %> <палец испорчен %>"
+measure() {
+  local d=$1 dir="$WORK/$1" attempt
+  for attempt in 1 2; do
+    rm -rf "$dir"; mkdir -p "$dir"
+    stop_fprintd
+    env G_MESSAGES_DEBUG=libfprint-ft9366 FT9366_IMG_DAC="$d" FT9366_DUMP="$dir" \
+      /usr/libexec/fprintd -t >"$dir/fprintd.log" 2>&1 &
+    local fpd=$!
+    sleep 2
+    printf '\n>>> Усиление %s: приложите палец на секунду и уберите\n' "$d" >&2
+    timeout 40 fprintd-enroll -f right-index-finger "$TARGET_USER" >/dev/null 2>&1 &
+    local enr=$!
+    for _ in $(seq 1 80); do
+      compgen -G "$dir/*.frame.pgm" >/dev/null && break
+      kill -0 "$enr" 2>/dev/null || break
+      sleep 0.5
+    done
+    sleep 0.5
+    kill "$enr" 2>/dev/null || true
+    kill "$fpd" 2>/dev/null || true
+    wait "$fpd" 2>/dev/null || true
+    if grep -q "ignoring invalid FT9366_IMG_DAC" "$dir/fprintd.log"; then
+      echo "Драйвер не принял значение $d — установлен libfprint без поддержки FT9366_IMG_DAC?" >&2
+      return 1
+    fi
+    if compgen -G "$dir/*.frame.pgm" >/dev/null; then
+      python3 -I - "$dir" <<'EOF'
+import sys, glob, struct, os
+def load(p):
+    b = open(p, 'rb').read()
+    head, data = b.split(b'\n', 1)
+    _, w, h, mx = head.split(); w, h, mx = int(w), int(h), int(mx)
+    return list(struct.unpack('>%dH' % (w*h), data[:2*w*h])) if mx > 255 else list(data[:w*h])
+f = sorted(glob.glob(os.path.join(sys.argv[1], '*.frame.pgm')))[0]
+fr, bg = load(f), load(f.replace('.frame.pgm', '.bg.pgm'))
+n = len(fr)
+bad = lambda px: (sum(v == 0 for v in px) + sum(v >= 4090 for v in px)) / n * 100
+print(f"{sum(bg)/n:.0f} {bad(bg):.1f} {bad(fr):.1f}")
+EOF
+      rm -rf "$dir"
+      return 0
+    fi
+    echo "    касание не поймано, ещё раз" >&2
+  done
+  return 1
+}
+
+echo "Подбор усиления сканера отпечатков для пользователя $TARGET_USER."
+echo "Понадобится 2–7 касаний. Прикладывайте палец, только когда появится >>>."
+OLD=$(current_dac)
+d=$(( ${OLD:-0x3a} ))
+declare -A MEAN FB FF
+for _ in $(seq 1 $MAX_TRIES); do
+  hex=$(printf '0x%02x' "$d")
+  out=$(measure "$hex") || { echo "Не удалось снять кадр при $hex"; break; }
+  read -r mean fb ff <<<"$out"
+  MEAN[$d]=$mean FB[$d]=$fb FF[$d]=$ff
+  printf '    фон: среднее %s, испорчено %s%%; с пальцем испорчено %s%%\n' "$mean" "$fb" "$ff"
+  if (( mean >= 1400 && mean <= 2600 )) && [[ ${fb%.*} -lt 5 && ${ff%.*} -lt 10 ]]; then
+    break
+  fi
+  step=$(( (TARGET - mean) / 600 ))
+  (( step == 0 )) && step=$(( mean < TARGET ? 1 : -1 ))
+  (( step > 4 )) && step=4
+  (( step < -4 )) && step=-4
+  nd=$(( d + step ))
+  (( nd < DAC_MIN )) && nd=$((DAC_MIN))
+  (( nd > DAC_MAX )) && nd=$((DAC_MAX))
+  [[ -n ${MEAN[$nd]:-} ]] && break
+  d=$nd
+done
+
+BEST="" BESTSCORE=999999
+for k in "${!MEAN[@]}"; do
+  [[ ${FB[$k]%.*} -lt 5 && ${FF[$k]%.*} -lt 10 ]] || continue
+  s=$(( MEAN[$k] > TARGET ? MEAN[$k] - TARGET : TARGET - MEAN[$k] ))
+  (( s < BESTSCORE )) && { BESTSCORE=$s; BEST=$k; }
+done
+
+echo
+if [[ -z $BEST ]]; then
+  echo "Чистого кадра получить не удалось — настройки не меняю."
+  exit 2
+fi
+NEW=$(printf '0x%02x' "$BEST")
+echo "Выбрано усиление $NEW (средняя яркость фона ${MEAN[$BEST]} из 4095)."
+
+if [[ $NEW == "$OLD" ]]; then
+  echo "Совпадает с текущим — ничего менять не нужно."
+  exit 0
+fi
+
+mkdir -p "$(dirname "$DROPIN")"
+cat > "$DROPIN" <<EOF
+# Усиление изображения сканера FT9366, подобрано ft9366-tune-dac ($(date +%F))
+[Service]
+Environment=FT9366_IMG_DAC=$NEW
+EOF
+systemctl daemon-reload
+stop_fprintd   # следующий запуск службы возьмёт новое значение
+
+if fprintd-list "$TARGET_USER" 2>/dev/null | grep -q ' - #'; then
+  echo
+  echo "Отпечатки записаны при старом усилении ($OLD) и теперь, скорее всего, не совпадут."
+  ans=y
+  if [[ -t 0 ]]; then read -r -p "Удалить их, чтобы записать заново? [Y/n] " ans || ans=y; fi
+  if [[ ${ans,,} != n* ]]; then
+    fprintd-delete "$TARGET_USER" >/dev/null 2>&1 || true
+    echo "Удалены. Запишите палец в приложении «Отпечатки пальцев» или командой fprintd-enroll."
+  fi
+fi
+echo "ГОТОВО."

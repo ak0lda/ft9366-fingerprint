@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# fingerprint-settings-helper ЗОНА on|off — где разрешён вход по отпечатку (запускается через pkexec).
+#   terminal  sudo, sudo -i, su        (/etc/pam.d/sudo, /etc/pam.d/su: system-auth <-> password-auth)
+#   polkit    окна «Требуется аутентификация» (/etc/pam.d/polkit-1 поверх /usr/lib/pam.d/polkit-1)
+#   login     экран входа GDM          (dconf базы gdm: org.gnome.login-screen)
+# password-auth в Fedora — тот же набор, что system-auth, но без pam_fprintd: пароль работает всегда.
+set -euo pipefail
+PATH=/usr/sbin:/usr/bin
+zone=${1:-} state=${2:-}
+[[ $EUID -eq 0 ]] || { echo "нужны права root" >&2; exit 1; }
+[[ $state == on || $state == off ]] || { echo "использование: $0 terminal|polkit|login on|off" >&2; exit 2; }
+MARK="# managed by fingerprint-settings"
+
+if [[ $state == on ]]; then from=password-auth to=system-auth; else from=system-auth to=password-auth; fi
+
+backup() { [[ -e "$1.fingerprint-settings.orig" ]] || cp -a "$1" "$1.fingerprint-settings.orig"; }
+
+case $zone in
+  terminal)
+    backup /etc/pam.d/sudo
+    sed -i -E "s/^(auth[[:space:]]+include[[:space:]]+)${from}([[:space:]]*)$/\1${to}\2/" /etc/pam.d/sudo
+    grep -Eq "^auth[[:space:]]+include[[:space:]]+${to}[[:space:]]*$" /etc/pam.d/sudo || { echo "не удалось изменить /etc/pam.d/sudo" >&2; exit 1; }
+    if [[ -f /etc/pam.d/su ]]; then
+      backup /etc/pam.d/su
+      sed -i -E "s/^(auth[[:space:]]+substack[[:space:]]+)${from}([[:space:]]*)$/\1${to}\2/" /etc/pam.d/su
+    fi
+    ;;
+  polkit)
+    if [[ $state == off ]]; then
+      if [[ -e /etc/pam.d/polkit-1 ]] && ! grep -qF "$MARK" /etc/pam.d/polkit-1; then
+        echo "/etc/pam.d/polkit-1 уже существует и создан не этим приложением — не трогаю" >&2; exit 1
+      fi
+      { echo "$MARK"; sed -E 's/^(auth[[:space:]]+include[[:space:]]+)system-auth/\1password-auth/' /usr/lib/pam.d/polkit-1; } \
+        > /etc/pam.d/polkit-1.tmp
+      mv -f /etc/pam.d/polkit-1.tmp /etc/pam.d/polkit-1
+      chmod 0644 /etc/pam.d/polkit-1
+    else
+      if [[ -e /etc/pam.d/polkit-1 ]] && grep -qF "$MARK" /etc/pam.d/polkit-1; then rm -f /etc/pam.d/polkit-1; fi
+    fi
+    ;;
+  login)
+    f=/etc/dconf/db/gdm.d/95-fingerprint-settings
+    if [[ $state == off ]]; then
+      mkdir -p /etc/dconf/db/gdm.d
+      printf '%s\n[org/gnome/login-screen]\nenable-fingerprint-authentication=false\n' "$MARK" > "$f"
+    else
+      rm -f "$f"
+    fi
+    dconf update
+    ;;
+  *) echo "неизвестная зона: $zone" >&2; exit 2 ;;
+esac
+command -v restorecon >/dev/null && restorecon -F /etc/pam.d /etc/pam.d/* /etc/dconf/db 2>/dev/null || true
+echo "$zone: $state"

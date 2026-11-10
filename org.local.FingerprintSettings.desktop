@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Fingerprints
+Name[ru]=Отпечатки пальцев
+Comment=Manage fingerprints and where they are used
+Comment[ru]=Записать отпечатки и выбрать, где ими входить: экран входа, блокировка, терминал
+Icon=auth-fingerprint-symbolic
+Exec=/usr/local/bin/fingerprint-settings
+Terminal=false
+Categories=GTK;GNOME;Settings;Security;
+Keywords=fingerprint;fprint;sudo;login;unlock;отпечаток;палец;сканер;вход;разблокировка;
+StartupNotify=true

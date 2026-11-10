@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <action id="org.local.fingerprint-settings.helper">
+    <description>Change where fingerprint authentication is allowed</description>
+    <description xml:lang="ru">Изменить, где разрешён вход по отпечатку пальца</description>
+    <message>Authentication is required to change where fingerprints are used</message>
+    <message xml:lang="ru">Чтобы изменить, где используется отпечаток пальца, требуется аутентификация</message>
+    <icon_name>auth-fingerprint-symbolic</icon_name>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/libexec/fingerprint-settings-helper</annotate>
+  </action>
+</policyconfig>
