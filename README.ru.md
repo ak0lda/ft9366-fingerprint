@@ -20,7 +20,7 @@
 ## Установка
 
 ```bash
-git clone https://github.com/<your-username>/ft9366-fingerprint.git
+git clone https://github.com/ak0lda/ft9366-fingerprint.git
 cd ft9366-fingerprint
 sudo ./install.sh            # всё сразу
 sudo ./install.sh driver     # только драйвер
