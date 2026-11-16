@@ -9,13 +9,15 @@
 #   sudo ./install.sh uninstall  вернуть всё как было (стандартный libfprint, PAM, настройки)
 #
 # Драйвер: открытый ft9366 из https://github.com/tattwamashi/libfprint-ft9366-pkg (патч проверен,
-# sha256 ниже) + правка ft9366-dac-env.patch (усиление через FT9366_IMG_DAC).
+# sha256 ниже) + правки ft9366-dac-env.patch (усиление через FT9366_IMG_DAC)
+# и ft9366-speed.patch (распознавание на всех ядрах, кэш шаблонов).
 set -euo pipefail
 
-KIT_REV=1
+KIT_REV=2
 KIT_DIR=$(cd "$(dirname "$0")" && pwd)
 DRIVER_SHA=7eef11147e47452c0ceeaf1525090a2fc6ae92835d1f7ef439570c27966cb519
 DAC_SHA=d73f3ad013545002b91291d559cceeefdbca4e5337be983b3287cd8bc294d9da
+SPEED_SHA=63da19d41b2ec8188710e5ccb6966530c07ea814bfa6ff117ab9b0b7552026e0
 DROPIN=/etc/systemd/system/fprintd.service.d/ft9366-dac.conf
 
 [[ $EUID -eq 0 && -n ${SUDO_USER:-} && $SUDO_USER != root ]] || {
@@ -34,7 +36,8 @@ install_driver() {
   step "Драйвер: проверка патчей"
   (cd "$KIT_DIR/patches" &&
    echo "$DRIVER_SHA  ft9366-driver.patch" | sha256sum -c --quiet &&
-   echo "$DAC_SHA  ft9366-dac-env.patch"   | sha256sum -c --quiet) || die "патчи изменены — сверьте sha256"
+   echo "$DAC_SHA  ft9366-dac-env.patch"   | sha256sum -c --quiet &&
+   echo "$SPEED_SHA  ft9366-speed.patch"    | sha256sum -c --quiet) || die "патчи изменены — сверьте sha256"
 
   step "Драйвер: исходники libfprint из Fedora"
   local top="$UHOME/.cache/ft9366-fingerprint/rpmbuild"
@@ -51,7 +54,7 @@ cd ../SPECS
 rel=$(rpmspec -q --srpm --qf '%{release}' libfprint.spec 2>/dev/null)
 base=${rel%%.fc*}
 sed -i -E "s/^Release:.*/Release:        ${base}.ft9366.${rev}%{?dist}/" libfprint.spec
-sed -i '/^Source0:/a Patch100:       ft9366-driver.patch\nPatch101:       ft9366-dac-env.patch' libfprint.spec
+sed -i '/^Source0:/a Patch100:       ft9366-driver.patch\nPatch101:       ft9366-dac-env.patch\nPatch102:       ft9366-speed.patch' libfprint.spec
 echo "Исходник: $srpm"
 EOS
   local spec="$top/SPECS/libfprint.spec"
@@ -68,7 +71,8 @@ EOS
 
   step "Драйвер: установка и фиксация версии"
   dnf versionlock delete libfprint >/dev/null 2>&1 || true
-  rpm -Uvh --oldpackage --replacepkgs "$rpm"
+  # пакет собран здесь же и не подписан: rpm проверит контрольные суммы, а не подпись
+  rpm -Uvh --oldpackage --replacepkgs --define "_pkgverify_level digest" "$rpm"
   dnf versionlock add libfprint
   systemctl stop fprintd.service 2>/dev/null || true
   authselect current 2>/dev/null | grep -q with-fingerprint || authselect enable-feature with-fingerprint

@@ -1,0 +1,530 @@
+Speed up FT9366 matching: build templates on all CPUs, cache them
+
+Every verify rebuilt each enrolled print's template from its 20 images
+(20 keypoint extractions + 190 pairwise registrations, ~0.5 s per finger on
+one core). Now these jobs run in parallel, built templates are cached while
+fprintd runs, the probe's keypoints are extracted once per touch, and
+enrollment registers each new image incrementally instead of rebuilding.
+Matching results are unchanged.
+
+diff --git a/libfprint/drivers/ft9366-match.c b/libfprint/drivers/ft9366-match.c
+index cc4cebb..135b480 100644
+--- a/libfprint/drivers/ft9366-match.c
++++ b/libfprint/drivers/ft9366-match.c
+@@ -883,40 +883,157 @@ ft9366_match (const Ft9366Features *probe, const Ft9366Features *enrolled)
+ struct _Ft9366Template
+ {
+   guint            n;
++  guint            cap;
+   Ft9366Features **features;
++  guint           *links;      /* links[i * cap + j]: inliers if registered, else 0 */
++  Pose            *poses;      /* poses[i * cap + j]: image i -> image j */
+   Pose            *to_frame;   /* image -> its group's frame */
+   guint           *group;
+ };
+ 
+-Ft9366Template *
+-ft9366_template_new (const guint8 * const *images, guint n)
++/* ---- parallel work -------------------------------------------------------- */
++/*
++ * Building a template is the slow part of every verify: a 20-image print
++ * needs 20 keypoint extractions and 190 pairwise registrations, about half a
++ * second on one core. All of them are independent and the matcher keeps no
++ * shared state, so they are spread over the CPUs. Results do not depend on
++ * the order the jobs run in.
++ */
++
++typedef void (*Ft9366Job) (guint    k,
++                           gpointer data);
++
++typedef struct
+ {
+-  Ft9366Template *tpl = g_new0 (Ft9366Template, 1);
+-  g_autofree guint *links = g_new0 (guint, n * n);
+-  g_autofree Pose *poses = g_new (Pose, n * n);   /* poses[i * n + j]: i -> j */
+-  g_autofree gboolean *placed = g_new0 (gboolean, n);
+-  guint groups = 0;
++  Ft9366Job job;
++  gpointer  data;
++  guint     count;
++  gint      next;
++} Ft9366Work;
++
++static gpointer
++work_thread (gpointer user_data)
++{
++  Ft9366Work *w = user_data;
+ 
+-  tpl->n = n;
+-  tpl->features = g_new (Ft9366Features *, n);
+-  tpl->to_frame = g_new (Pose, n);
+-  tpl->group = g_new (guint, n);
+-  for (guint i = 0; i < n; i++)
+-    tpl->features[i] = ft9366_features_new (images[i]);
+-
+-  for (guint i = 0; i < n; i++)
+-    for (guint j = i + 1; j < n; j++)
+-      {
+-        Pose p;
+-        guint inl = match_pose (tpl->features[i], tpl->features[j], &p);
++  for (;;)
++    {
++      guint k = (guint) g_atomic_int_add (&w->next, 1);
++
++      if (k >= w->count)
++        break;
++      w->job (k, w->data);
++    }
++  return NULL;
++}
++
++static void
++run_parallel (guint count, Ft9366Job job, gpointer data)
++{
++  Ft9366Work w = { job, data, count, 0 };
++  guint n_threads = MIN (count, (guint) g_get_num_processors ());
++  g_autofree GThread **threads = NULL;
++  guint started = 0;
+ 
+-        links[i * n + j] = links[j * n + i] = inl >= FT9366_LINK_MIN ? inl : 0;
+-        poses[i * n + j] = p;
+-        poses[j * n + i] = pose_invert (&p);
++  if (n_threads > 1)
++    {
++      threads = g_new0 (GThread *, n_threads - 1);
++      for (guint t = 0; t < n_threads - 1; t++)
++        {
++          threads[t] = g_thread_try_new ("ft9366-match", work_thread, &w, NULL);
++          if (!threads[t])
++            break;   /* fewer helpers is fine, this thread does the rest */
++          started++;
++        }
++    }
++
++  work_thread (&w);
++  for (guint t = 0; t < started; t++)
++    g_thread_join (threads[t]);
++}
++
++/* ---- template ----------------------------------------------------------- */
++
++static void
++template_reserve (Ft9366Template *tpl, guint cap)
++{
++  guint *links;
++  Pose *poses;
++
++  if (cap <= tpl->cap)
++    return;
++
++  links = g_new0 (guint, cap * cap);
++  poses = g_new0 (Pose, cap * cap);
++  for (guint i = 0; i < tpl->n; i++)
++    for (guint j = 0; j < tpl->n; j++)
++      {
++        links[i * cap + j] = tpl->links[i * tpl->cap + j];
++        poses[i * cap + j] = tpl->poses[i * tpl->cap + j];
+       }
++  g_free (tpl->links);
++  g_free (tpl->poses);
++  tpl->links = links;
++  tpl->poses = poses;
++  tpl->features = g_renew (Ft9366Features *, tpl->features, cap);
++  tpl->to_frame = g_renew (Pose, tpl->to_frame, cap);
++  tpl->group = g_renew (guint, tpl->group, cap);
++  tpl->cap = cap;
++}
++
++typedef struct
++{
++  const guint8 * const *images;
++  Ft9366Features      **out;
++} FeaturesJob;
++
++static void
++features_job (guint k, gpointer data)
++{
++  FeaturesJob *fj = data;
++
++  fj->out[k] = ft9366_features_new (fj->images[k]);
++}
++
++/* jobs over all (i, j); only pairs that involve a new image do work */
++typedef struct
++{
++  Ft9366Template *tpl;
++  guint           first;   /* images first..n-1 are new */
++} LinkJob;
++
++static void
++link_pair (Ft9366Template *tpl, guint i, guint j)
++{
++  Pose p;
++  guint inl = match_pose (tpl->features[i], tpl->features[j], &p);
++  guint c = tpl->cap;
++
++  tpl->links[i * c + j] = tpl->links[j * c + i] = inl >= FT9366_LINK_MIN ? inl : 0;
++  tpl->poses[i * c + j] = p;
++  tpl->poses[j * c + i] = pose_invert (&p);
++}
++
++static void
++link_job (guint k, gpointer data)
++{
++  LinkJob *lj = data;
++  guint n = lj->tpl->n, i = k / n, j = k % n;
++
++  /* every pair i < j where j is new; each job writes only its own cells */
++  if (i < j && j >= lj->first)
++    link_pair (lj->tpl, i, j);
++}
++
++/* Prim's maximum spanning tree, one tree per connected group, rooted at
++ * the best-connected image left */
++static void
++template_build_tree (Ft9366Template *tpl)
++{
++  const guint n = tpl->n, c = tpl->cap;
++  g_autofree gboolean *placed = g_new0 (gboolean, MAX (n, 1));
++  guint groups = 0;
+ 
+-  /* Prim's maximum spanning tree, one tree per connected group, rooted at
+-   * the best-connected image left */
+   for (;;)
+     {
+       guint root = n, root_w = 0;
+@@ -928,7 +1045,7 @@ ft9366_template_new (const guint8 * const *images, guint n)
+           if (placed[i])
+             continue;
+           for (guint j = 0; j < n; j++)
+-            w += links[i * n + j];
++            w += tpl->links[i * c + j];
+           if (root == n || w > root_w)
+             {
+               root = i;
+@@ -948,9 +1065,9 @@ ft9366_template_new (const guint8 * const *images, guint n)
+           for (guint u = 0; u < n; u++)
+             if (placed[u] && tpl->group[u] == groups)
+               for (guint v = 0; v < n; v++)
+-                if (!placed[v] && links[u * n + v] > bw)
++                if (!placed[v] && tpl->links[u * c + v] > bw)
+                   {
+-                    bw = links[u * n + v];
++                    bw = tpl->links[u * c + v];
+                     bu = u;
+                     bv = v;
+                   }
+@@ -958,14 +1075,52 @@ ft9366_template_new (const guint8 * const *images, guint n)
+             break;
+           placed[bv] = TRUE;
+           tpl->group[bv] = groups;
+-          tpl->to_frame[bv] = pose_compose (&poses[bv * n + bu], &tpl->to_frame[bu]);
++          tpl->to_frame[bv] = pose_compose (&tpl->poses[bv * c + bu], &tpl->to_frame[bu]);
+         }
+       groups++;
+     }
++}
++
++/* register images first..n-1 with all earlier ones, then rebuild the tree */
++static void
++template_link (Ft9366Template *tpl, guint first)
++{
++  LinkJob lj = { tpl, first };
++
++  if (tpl->n > 1 && first < tpl->n)
++    run_parallel (tpl->n * tpl->n, link_job, &lj);
++  template_build_tree (tpl);
++}
++
++Ft9366Template *
++ft9366_template_new (const guint8 * const *images, guint n)
++{
++  Ft9366Template *tpl = g_new0 (Ft9366Template, 1);
++  FeaturesJob fj;
+ 
++  template_reserve (tpl, MAX (n, 1));
++  fj = (FeaturesJob) { images, tpl->features };
++  run_parallel (n, features_job, &fj);
++  tpl->n = n;
++  template_link (tpl, 0);
+   return tpl;
+ }
+ 
++void
++ft9366_template_add (Ft9366Template *tpl, Ft9366Features *features)
++{
++  if (tpl->n == tpl->cap)
++    template_reserve (tpl, tpl->cap * 2);
++  tpl->features[tpl->n++] = features;
++  template_link (tpl, tpl->n - 1);
++}
++
++guint
++ft9366_template_size (const Ft9366Template *tpl)
++{
++  return tpl->n;
++}
++
+ void
+ ft9366_template_free (Ft9366Template *tpl)
+ {
+@@ -974,6 +1129,8 @@ ft9366_template_free (Ft9366Template *tpl)
+   for (guint i = 0; i < tpl->n; i++)
+     ft9366_features_free (tpl->features[i]);
+   g_free (tpl->features);
++  g_free (tpl->links);
++  g_free (tpl->poses);
+   g_free (tpl->to_frame);
+   g_free (tpl->group);
+   g_free (tpl);
+diff --git a/libfprint/drivers/ft9366-match.h b/libfprint/drivers/ft9366-match.h
+index 0056ec0..f7e021b 100644
+--- a/libfprint/drivers/ft9366-match.h
++++ b/libfprint/drivers/ft9366-match.h
+@@ -65,6 +65,11 @@ typedef struct _Ft9366Template Ft9366Template;
+ 
+ Ft9366Template *ft9366_template_new (const guint8 * const *images,
+                                      guint                n);
++/* register one more image into the template (takes ownership of features);
++ * the result is the same as building the template from all images at once */
++void            ft9366_template_add (Ft9366Template *tpl,
++                                     Ft9366Features *features);
++guint           ft9366_template_size (const Ft9366Template *tpl);
+ void            ft9366_template_free (Ft9366Template *tpl);
+ guint           ft9366_template_groups (const Ft9366Template *tpl);
+ guint           ft9366_template_match (const Ft9366Template *tpl,
+diff --git a/libfprint/drivers/ft9366.c b/libfprint/drivers/ft9366.c
+index afc44cd..c7db1f5 100644
+--- a/libfprint/drivers/ft9366.c
++++ b/libfprint/drivers/ft9366.c
+@@ -115,6 +115,7 @@ ft9366_img_dac (void)
+ #define FT9366_MAX_DUPS        1    /* then take it anyway rather than loop */
+ #define FT9366_MIN_COVERAGE    0.4  /* share of the sensor a usable touch covers */
+ #define FT9366_PRINT_VERSION   2
++#define FT9366_TEMPLATE_CACHE  10   /* built templates kept while fprintd runs */
+ 
+ /* ---- op tables ---------------------------------------------------------- */
+ 
+@@ -319,7 +320,13 @@ struct _FpiDeviceFt9366
+ 
+   /* enroll */
+   GPtrArray      *enroll_images;
++  Ft9366Template *enroll_tpl;      /* enroll_images, registered as they come */
+   guint           enroll_dups;     /* consecutive near-duplicate touches */
++
++  /* print data (GBytes) -> Ft9366Template: building a template takes far
++   * longer than matching against it, and the same prints come back for
++   * every verify while fprintd runs */
++  GHashTable     *tpl_cache;
+ };
+ G_DECLARE_FINAL_TYPE (FpiDeviceFt9366, fpi_device_ft9366, FPI, DEVICE_FT9366, FpDevice);
+ G_DEFINE_TYPE (FpiDeviceFt9366, fpi_device_ft9366, FP_TYPE_DEVICE);
+@@ -765,25 +772,31 @@ print_data_new (GPtrArray *images)
+ 
+ /* the current capture against an enrolled print: its images are registered
+  * into a template (ft9366-match.c) and matched as a whole */
+-static gboolean
+-match_print (FpiDeviceFt9366 *self, FpPrint *print, Ft9366MatchInfo *info)
++static void
++tpl_cache_add (FpiDeviceFt9366 *self, GVariant *data, Ft9366Template *tpl)
+ {
+-  g_autoptr(GVariant) data = NULL;
++  if (g_hash_table_size (self->tpl_cache) >= FT9366_TEMPLATE_CACHE)
++    g_hash_table_remove_all (self->tpl_cache);
++  g_hash_table_insert (self->tpl_cache, g_variant_get_data_as_bytes (data), tpl);
++}
++
++static Ft9366Template *
++print_template (FpiDeviceFt9366 *self, GVariant *data)
++{
++  g_autoptr(GBytes) key = g_variant_get_data_as_bytes (data);
+   g_autoptr(GVariant) images = NULL;
+-  g_autoptr(Ft9366Features) probe = NULL;
+-  g_autoptr(Ft9366Template) tpl = NULL;
+   g_autofree const guint8 **imgs = NULL;
++  Ft9366Template *tpl;
+   guint16 version;
+   guint n = 0;
+ 
+-  *info = (Ft9366MatchInfo) { 0 };
+-  g_object_get (print, "fpi-data", &data, NULL);
+-  if (!data || !g_variant_check_format_string (data, "(qaay)", FALSE))
+-    return FALSE;
++  tpl = g_hash_table_lookup (self->tpl_cache, key);
++  if (tpl)
++    return tpl;
+ 
+   g_variant_get (data, "(q@aay)", &version, &images);
+   if (version != FT9366_PRINT_VERSION)
+-    return FALSE;
++    return NULL;
+ 
+   imgs = g_new (const guint8 *, g_variant_n_children (images));
+   for (gsize i = 0; i < g_variant_n_children (images); i++)
+@@ -797,10 +810,29 @@ match_print (FpiDeviceFt9366 *self, FpPrint *print, Ft9366MatchInfo *info)
+         imgs[n++] = img;
+     }
+   if (n == 0)
+-    return FALSE;
++    return NULL;
+ 
+   tpl = ft9366_template_new (imgs, n);
+-  probe = ft9366_features_new (self->image);
++  tpl_cache_add (self, data, tpl);
++  return tpl;
++}
++
++static gboolean
++match_print (FpiDeviceFt9366 *self, FpPrint *print, const Ft9366Features *probe,
++             Ft9366MatchInfo *info)
++{
++  g_autoptr(GVariant) data = NULL;
++  Ft9366Template *tpl;
++
++  *info = (Ft9366MatchInfo) { 0 };
++  g_object_get (print, "fpi-data", &data, NULL);
++  if (!data || !g_variant_check_format_string (data, "(qaay)", FALSE))
++    return FALSE;
++
++  tpl = print_template (self, data);
++  if (!tpl)
++    return FALSE;
++
+   ft9366_template_match_info (tpl, probe, info);
+   return ft9366_match_accept (info);
+ }
+@@ -1081,6 +1113,7 @@ action_fail (FpiDeviceFt9366 *self, GError *error)
+ 
+   self->action = OP_NONE;
+   g_clear_pointer (&self->enroll_images, g_ptr_array_unref);
++  g_clear_pointer (&self->enroll_tpl, ft9366_template_free);
+ 
+   switch (action)
+     {
+@@ -1107,6 +1140,8 @@ enroll_image (FpiDeviceFt9366 *self, gdouble coverage)
+ {
+   FpDevice *dev = FP_DEVICE (self);
+   FpPrint *print = NULL;
++  g_autoptr(Ft9366Features) probe = NULL;
++  GVariant *data;
+ 
+   if (coverage < FT9366_MIN_COVERAGE)
+     {
+@@ -1116,14 +1151,12 @@ enroll_image (FpiDeviceFt9366 *self, gdouble coverage)
+       return;
+     }
+ 
++  probe = ft9366_features_new (self->image);
+   if (self->enroll_images->len > 0 && self->enroll_dups < FT9366_MAX_DUPS)
+     {
+-      g_autoptr(Ft9366Template) tpl = ft9366_template_new ((const guint8 * const *) self->enroll_images->pdata,
+-                                                           self->enroll_images->len);
+-      g_autoptr(Ft9366Features) probe = ft9366_features_new (self->image);
+       Ft9366MatchInfo info;
+ 
+-      ft9366_template_match_info (tpl, probe, &info);
++      ft9366_template_match_info (self->enroll_tpl, probe, &info);
+       if (ft9366_match_accept (&info) && info.overlap >= FT9366_DUP_OVERLAP &&
+           info.ncc >= FT9366_DUP_NCC)
+         {
+@@ -1140,6 +1173,7 @@ enroll_image (FpiDeviceFt9366 *self, gdouble coverage)
+   self->enroll_dups = 0;
+ 
+   g_ptr_array_add (self->enroll_images, g_memdup2 (self->image, FT9366_FRAME_PIXELS));
++  ft9366_template_add (self->enroll_tpl, g_steal_pointer (&probe));
+   fpi_device_enroll_progress (dev, self->enroll_images->len, NULL, NULL);
+ 
+   if (self->enroll_images->len < fp_device_get_nr_enroll_stages (dev))
+@@ -1150,7 +1184,11 @@ enroll_image (FpiDeviceFt9366 *self, gdouble coverage)
+ 
+   fpi_device_get_enroll_data (dev, &print);
+   fpi_print_set_type (print, FPI_PRINT_RAW);
+-  g_object_set (print, "fpi-data", print_data_new (self->enroll_images), NULL);
++  data = g_variant_ref_sink (print_data_new (self->enroll_images));
++  g_object_set (print, "fpi-data", data, NULL);
++  /* the first verify after enrolling needs this very template */
++  tpl_cache_add (self, data, g_steal_pointer (&self->enroll_tpl));
++  g_variant_unref (data);
+ 
+   self->action = OP_NONE;
+   g_clear_pointer (&self->enroll_images, g_ptr_array_unref);
+@@ -1162,6 +1200,7 @@ verify_image (FpiDeviceFt9366 *self, gdouble coverage)
+ {
+   FpDevice *dev = FP_DEVICE (self);
+   FpPrint *print = NULL;
++  g_autoptr(Ft9366Features) probe = NULL;
+   Ft9366MatchInfo info;
+   gboolean match;
+ 
+@@ -1176,7 +1215,8 @@ verify_image (FpiDeviceFt9366 *self, gdouble coverage)
+     }
+ 
+   fpi_device_get_verify_data (dev, &print);
+-  match = match_print (self, print, &info);
++  probe = ft9366_features_new (self->image);
++  match = match_print (self, print, probe, &info);
+   fp_info ("verify score %u inliers, ridge correlation %.2f over %.0f%%: %s",
+            info.inliers, info.ncc, info.overlap * 100, match ? "match" : "no match");
+ 
+@@ -1190,6 +1230,7 @@ identify_image (FpiDeviceFt9366 *self, gdouble coverage)
+   FpDevice *dev = FP_DEVICE (self);
+   GPtrArray *prints = NULL;
+   FpPrint *match = NULL;
++  g_autoptr(Ft9366Features) probe = NULL;
+   guint best = 0;
+ 
+   self->action = OP_NONE;
+@@ -1203,11 +1244,12 @@ identify_image (FpiDeviceFt9366 *self, gdouble coverage)
+     }
+ 
+   fpi_device_get_identify_data (dev, &prints);
++  probe = ft9366_features_new (self->image);
+   for (guint i = 0; i < prints->len; i++)
+     {
+       FpPrint *print = g_ptr_array_index (prints, i);
+       Ft9366MatchInfo info;
+-      gboolean accept = match_print (self, print, &info);
++      gboolean accept = match_print (self, print, probe, &info);
+ 
+       fp_info ("identify print %u: %u inliers, ridge correlation %.2f: %s", i,
+                info.inliers, info.ncc, accept ? "match" : "no match");
+@@ -1333,6 +1375,8 @@ ft9366_enroll (FpDevice *dev)
+   FpiDeviceFt9366 *self = FPI_DEVICE_FT9366 (dev);
+ 
+   self->enroll_images = g_ptr_array_new_with_free_func (g_free);
++  g_clear_pointer (&self->enroll_tpl, ft9366_template_free);
++  self->enroll_tpl = ft9366_template_new (NULL, 0);
+   self->enroll_dups = 0;
+   start_action (self, OP_ENROLL);
+ }
+@@ -1357,13 +1401,30 @@ static const FpIdEntry id_table[] = {
+ static void
+ fpi_device_ft9366_init (FpiDeviceFt9366 *self)
+ {
++  self->tpl_cache = g_hash_table_new_full (g_bytes_hash, g_bytes_equal,
++                                           (GDestroyNotify) g_bytes_unref,
++                                           (GDestroyNotify) ft9366_template_free);
++}
++
++static void
++fpi_device_ft9366_finalize (GObject *object)
++{
++  FpiDeviceFt9366 *self = FPI_DEVICE_FT9366 (object);
++
++  g_clear_pointer (&self->enroll_images, g_ptr_array_unref);
++  g_clear_pointer (&self->enroll_tpl, ft9366_template_free);
++  g_clear_pointer (&self->tpl_cache, g_hash_table_unref);
++
++  G_OBJECT_CLASS (fpi_device_ft9366_parent_class)->finalize (object);
+ }
+ 
+ static void
+ fpi_device_ft9366_class_init (FpiDeviceFt9366Class *klass)
+ {
+   FpDeviceClass *dev_class = FP_DEVICE_CLASS (klass);
++  GObjectClass *object_class = G_OBJECT_CLASS (klass);
+ 
++  object_class->finalize = fpi_device_ft9366_finalize;
+   dev_class->id = FP_COMPONENT;
+   dev_class->full_name = "FocalTech FT9366 (RTS5811)";
+   dev_class->type = FP_DEVICE_TYPE_USB;

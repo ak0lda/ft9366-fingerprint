@@ -89,6 +89,15 @@ After changing the gain, enroll your fingers again.
 On Fedora `password-auth` is the same stack as `system-auth` minus `pam_fprintd`, so the
 password always keeps working. Original files are saved as `*.fingerprint-settings.orig`.
 
+### Matching speed
+
+Every touch is compared against each enrolled finger's template, built from its
+~20 enrollment images. The original driver rebuilt every template on every touch,
+on one core: about 0.5 s per enrolled finger. `ft9366-speed.patch` spreads that
+work over all CPU cores (≈6–7× faster) and keeps built templates in memory while
+fprintd runs, so a retry is instant. Enrollment no longer slows down towards the
+last touches. Matching results are unchanged, existing fingerprints keep working.
+
 ### Fedora updates
 
 `libfprint` is version-locked. When Fedora ships a new libfprint, rebuild:
@@ -111,8 +120,9 @@ If the patch no longer applies, the build stops and the installed version stays 
 | `org.local.FingerprintSettings.desktop` | App launcher |
 | `patches/ft9366-driver.patch` | FT9366 driver from [tattwamashi/libfprint-ft9366-pkg](https://github.com/tattwamashi/libfprint-ft9366-pkg) @ `9bdb018` |
 | `patches/ft9366-dac-env.patch` | Lets the gain be set via `FT9366_IMG_DAC` |
+| `patches/ft9366-speed.patch` | Faster matching: templates built on all CPU cores and cached |
 
-The installer verifies both patches by SHA-256 before building.
+The installer verifies all patches by SHA-256 before building.
 
 ## Security note
 
