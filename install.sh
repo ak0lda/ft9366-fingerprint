@@ -5,7 +5,8 @@
 #   sudo ./install.sh            всё: драйвер + подбор усиления + приложение «Отпечатки пальцев»
 #   sudo ./install.sh driver     только собрать и поставить libfprint с драйвером
 #   sudo ./install.sh tune       только подобрать усиление (после установки драйвера)
-#   sudo ./install.sh app        только приложение «Отпечатки пальцев»
+#   sudo ./install.sh app        только приложение «Отпечатки пальцев» (и значок 🫆 в приглашениях)
+#   sudo ./install.sh icon       только значок 🫆 перед «Положите палец…» в sudo, su и т. п.
 #   sudo ./install.sh uninstall  вернуть всё как было (стандартный libfprint, PAM, настройки)
 #
 # Драйвер: открытый ft9366 из https://github.com/tattwamashi/libfprint-ft9366-pkg (патч проверен,
@@ -100,14 +101,27 @@ install_app() {
     /usr/share/polkit-1/actions/org.local.fingerprint-settings.policy /usr/local/share/applications/org.local.FingerprintSettings.desktop || true
   update-desktop-database /usr/local/share/applications >/dev/null 2>&1 || true
   echo "Установлено: ищите «Отпечатки» в меню приложений."
+  install_icon
+}
+
+install_icon() {
+  step "Значок 🫆 в приглашении приложить палец"
+  install -m 0755 "$KIT_DIR/fingerprint-prompt-icon" /usr/local/sbin/fingerprint-prompt-icon
+  command -v restorecon >/dev/null && restorecon -F /usr/local/sbin/fingerprint-prompt-icon || true
+  # язык системы и язык пользователя (sudo сохраняет LANG)
+  /usr/local/sbin/fingerprint-prompt-icon enable "${LANG:-}" \
+    "$(sed -nE 's/^LANG="?([^"]*)"?/\1/p' /etc/locale.conf 2>/dev/null)" ||
+    echo "Значок не добавлен (нужна локаль вида ru_RU.UTF-8) — остальное работает как обычно."
 }
 
 uninstall() {
   step "Удаление"
   for z in terminal polkit login; do /usr/local/libexec/fingerprint-settings-helper "$z" on 2>/dev/null || true; done
+  /usr/local/sbin/fingerprint-prompt-icon disable 2>/dev/null || true
   rm -f /usr/local/bin/fingerprint-settings /usr/local/libexec/fingerprint-settings-helper \
         /usr/share/polkit-1/actions/org.local.fingerprint-settings.policy \
-        /usr/local/share/applications/org.local.FingerprintSettings.desktop /usr/local/sbin/ft9366-tune-dac
+        /usr/local/share/applications/org.local.FingerprintSettings.desktop /usr/local/sbin/ft9366-tune-dac \
+        /usr/local/sbin/fingerprint-prompt-icon
   rm -f "$DROPIN"; rmdir --ignore-fail-on-non-empty "$(dirname "$DROPIN")" 2>/dev/null || true
   systemctl daemon-reload; systemctl stop fprintd.service 2>/dev/null || true
   dnf versionlock delete libfprint >/dev/null 2>&1 || true
@@ -120,7 +134,8 @@ case ${1:-all} in
   driver)    check_hw; install_driver ;;
   tune)      check_hw; tune ;;
   app)       install_app ;;
+  icon)      install_icon ;;
   uninstall) uninstall ;;
-  *) sed -n '3,11p' "$0"; exit 2 ;;
+  *) sed -n '3,12p' "$0"; exit 2 ;;
 esac
 echo; echo "ГОТОВО."

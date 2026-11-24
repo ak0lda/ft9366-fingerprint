@@ -14,6 +14,7 @@
 | `ft9366-tune-dac` | Подбор усиления изображения под конкретный экземпляр сканера (2–7 касаний) |
 | `fingerprint-settings` | Приложение «Отпечатки пальцев»: запись/удаление/проверка пальцев и выбор, где ими входить |
 | `fingerprint-settings-helper` | Помощник приложения (через pkexec): меняет PAM и настройки экрана входа |
+| `fingerprint-prompt-icon` | Значок 🫆 перед «Положите палец…» в sudo, su и т. п.: свой перевод для `ru_RU` поверх пакетного `ru`, обновляется после обновления fprintd; файлы пакета не меняются |
 | `patches/ft9366-driver.patch` | Открытый драйвер, [tattwamashi/libfprint-ft9366-pkg](https://github.com/tattwamashi/libfprint-ft9366-pkg) @ `9bdb018` |
 | `patches/ft9366-dac-env.patch` | Своя правка: усиление через переменную `FT9366_IMG_DAC` (как в upstream PR #4) |
 | `patches/ft9366-speed.patch` | Своя правка: распознавание на всех ядрах процессора и кэш шаблонов |
@@ -26,7 +27,8 @@ cd ft9366-fingerprint
 sudo ./install.sh            # всё сразу
 sudo ./install.sh driver     # только драйвер
 sudo ./install.sh tune       # только подобрать усиление
-sudo ./install.sh app        # только приложение
+sudo ./install.sh app        # только приложение (и значок 🫆)
+sudo ./install.sh icon       # только значок 🫆 в приглашении приложить палец
 sudo ./install.sh uninstall  # вернуть как было
 ```
 

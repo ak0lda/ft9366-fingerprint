@@ -1,0 +1,249 @@
+#!/usr/bin/python3 -I
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""fingerprint-prompt-icon — значок 🫆 перед просьбой приложить палец (sudo, su, экран блокировки).
+
+Текст «Положите палец…» печатает pam_fprintd из пакета fprintd, беря перевод из
+/usr/share/locale/<язык>/LC_MESSAGES/fprintd.mo. Пакетный файл не трогаем: рядом кладётся
+свой перевод для языка с регионом (ru_RU, en_US…) — gettext ищет его раньше общего (ru).
+Это полная копия пакетного перевода, где к приглашениям добавлен значок. После обновления
+fprintd копию пересобирает служба fingerprint-prompt-icon.path.
+
+  fingerprint-prompt-icon enable [ЛОКАЛЬ…]   включить (по умолчанию — LANG из /etc/locale.conf)
+  fingerprint-prompt-icon refresh            пересобрать после обновления fprintd
+  fingerprint-prompt-icon disable            убрать всё
+"""
+import glob
+import os
+import shutil
+import struct
+import subprocess
+import sys
+
+DOMAIN = "fprintd"
+LOCALEDIR = "/usr/share/locale"
+CONF = "/etc/fingerprint-settings/prompt-icon.conf"
+UNIT_DIR = "/etc/systemd/system"
+UNIT = "fingerprint-prompt-icon"
+ICON = "\U0001FAC6"   # 🫆 FINGERPRINT (Unicode 16, есть в Noto Color Emoji)
+MARK = "X-Fingerprint-Settings: prompt-icon"
+
+# ошибки перевода в самом fprintd, раз уж строка всё равно меняется
+FIXES = {
+    "Положите пальцы на считывающее устройство": "Положите палец на считывающее устройство",
+}
+
+
+def is_prompt(msgid):
+    return msgid.startswith(("Place your ", "Swipe your "))
+
+
+# ---- .mo ---------------------------------------------------------------------
+
+def read_mo(path):
+    data = open(path, "rb").read()
+    magic = struct.unpack("<I", data[:4])[0]
+    end = "<" if magic == 0x950412DE else ">" if magic == 0xDE120495 else None
+    if end is None:
+        raise ValueError(f"{path}: не файл .mo")
+    _, n, korig, ktrans = struct.unpack(end + "4I", data[4:20])
+    entries = {}
+    for i in range(n):
+        klen, koff = struct.unpack(end + "2I", data[korig + 8 * i:korig + 8 * i + 8])
+        vlen, voff = struct.unpack(end + "2I", data[ktrans + 8 * i:ktrans + 8 * i + 8])
+        entries[data[koff:koff + klen]] = data[voff:voff + vlen]
+    return entries
+
+
+def write_mo(path, entries):
+    keys = sorted(entries)
+    n = len(keys)
+    korig = 28
+    ktrans = korig + 8 * n
+    pos = ktrans + 8 * n
+    table_k, table_v, blob = [], [], b""
+    for k in keys:
+        table_k.append((len(k), pos + len(blob)))
+        blob += k + b"\0"
+    for k in keys:
+        v = entries[k]
+        table_v.append((len(v), pos + len(blob)))
+        blob += v + b"\0"
+    out = struct.pack("<7I", 0x950412DE, 0, n, korig, ktrans, 0, 0)
+    out += b"".join(struct.pack("<2I", *e) for e in table_k)
+    out += b"".join(struct.pack("<2I", *e) for e in table_v)
+    out += blob
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(out)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+
+
+def is_ours(path):
+    try:
+        return MARK.encode() in read_mo(path).get(b"", b"")
+    except (OSError, ValueError):
+        return False
+
+
+# ---- locales -------------------------------------------------------------------
+
+def split_locale(loc):
+    """ru_RU.UTF-8@x -> ('ru_RU', 'ru'); None, если переопределить нельзя"""
+    base = loc.split(".")[0].split("@")[0]
+    if "_" not in base or base in ("C", "POSIX"):
+        return None
+    return base, base.split("_")[0]
+
+
+def any_catalog():
+    found = sorted(glob.glob(f"{LOCALEDIR}/*/LC_MESSAGES/{DOMAIN}.mo"))
+    found = [p for p in found if not is_ours(p)]
+    return found[0] if found else None
+
+
+def source_for(lang):
+    """пакетный перевод для языка; для английского — любой, ради списка строк"""
+    p = f"{LOCALEDIR}/{lang}/LC_MESSAGES/{DOMAIN}.mo"
+    if os.path.exists(p):
+        return p, True
+    return any_catalog(), False
+
+
+def build(loc):
+    parts = split_locale(loc)
+    if not parts:
+        print(f"{loc}: пропускаю (нужна локаль вида ru_RU)")
+        return None
+    region, lang = parts
+    out = f"{LOCALEDIR}/{region}/LC_MESSAGES/{DOMAIN}.mo"
+    if os.path.exists(out) and not is_ours(out):
+        print(f"{out} принадлежит системе — не трогаю")
+        return None
+    src, translated = source_for(lang)
+    if not src:
+        print(f"{loc}: переводов fprintd не найдено")
+        return None
+
+    entries = read_mo(src)
+    result = {}
+    for k, v in entries.items():
+        if k == b"":
+            continue
+        msgid = k.split(b"\0")[0].decode("utf-8", "replace")
+        text = v.decode("utf-8") if translated else k.decode("utf-8")
+        if not translated and not is_prompt(msgid):
+            continue   # без перевода gettext и так покажет английский
+        text = FIXES.get(text, text)
+        if is_prompt(msgid) and not text.startswith(ICON):
+            text = f"{ICON} {text}"
+        result[k] = text.encode("utf-8")
+
+    header = entries.get(b"", b"").decode("utf-8") if translated else ""
+    if "charset=" not in header:
+        header += "Content-Type: text/plain; charset=UTF-8\n"
+    result[b""] = (header.rstrip("\n") + "\n" + MARK + "\n").lstrip("\n").encode("utf-8")
+
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    write_mo(out, result)
+    if shutil.which("restorecon"):
+        subprocess.run(["restorecon", "-F", out], check=False)
+    n = sum(1 for k in result if k and is_prompt(k.split(b"\0")[0].decode("utf-8", "replace")))
+    print(f"{out}: значок добавлен в {n} приглашений")
+    return src
+
+
+# ---- commands ------------------------------------------------------------------
+
+def read_conf():
+    try:
+        return open(CONF).read().split()
+    except OSError:
+        return []
+
+
+def system_lang():
+    try:
+        for line in open("/etc/locale.conf"):
+            if line.startswith("LANG="):
+                return line.split("=", 1)[1].strip().strip('"')
+    except OSError:
+        pass
+    return None
+
+
+def write_units(sources):
+    watch = "\n".join(f"PathChanged={s}" for s in sorted(set(sources)))
+    with open(f"{UNIT_DIR}/{UNIT}.path", "w") as f:
+        f.write(f"""[Unit]
+Description=Значок отпечатка в приглашениях pam_fprintd: следить за обновлениями fprintd
+
+[Path]
+{watch}
+Unit={UNIT}.service
+
+[Install]
+WantedBy=paths.target
+""")
+    with open(f"{UNIT_DIR}/{UNIT}.service", "w") as f:
+        f.write(f"""[Unit]
+Description=Значок отпечатка в приглашениях pam_fprintd: пересобрать перевод
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/{UNIT} refresh
+""")
+    subprocess.run(["systemctl", "daemon-reload"], check=False)
+    subprocess.run(["systemctl", "enable", "--now", f"{UNIT}.path"], check=False,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def enable(locales):
+    locales = list(dict.fromkeys(l for l in locales if l)) or [system_lang() or ""]
+    sources = [s for s in (build(l) for l in locales) if s]
+    if not sources:
+        sys.exit("Ни одной локали не настроено.")
+    os.makedirs(os.path.dirname(CONF), exist_ok=True)
+    with open(CONF, "w") as f:
+        f.write("\n".join(locales) + "\n")
+    write_units(sources)
+
+
+def refresh():
+    for loc in read_conf():
+        build(loc)
+
+
+def disable():
+    subprocess.run(["systemctl", "disable", "--now", f"{UNIT}.path"], check=False,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for ext in ("path", "service"):
+        try:
+            os.remove(f"{UNIT_DIR}/{UNIT}.{ext}")
+        except FileNotFoundError:
+            pass
+    subprocess.run(["systemctl", "daemon-reload"], check=False)
+    for loc in read_conf():
+        parts = split_locale(loc)
+        if parts:
+            out = f"{LOCALEDIR}/{parts[0]}/LC_MESSAGES/{DOMAIN}.mo"
+            if is_ours(out):
+                os.remove(out)
+                print(f"{out}: убран")
+    try:
+        os.remove(CONF)
+    except FileNotFoundError:
+        pass
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if cmd not in ("enable", "refresh", "disable"):
+        sys.exit(__doc__)
+    if os.geteuid() != 0:
+        sys.exit("нужны права root")
+    {"enable": lambda: enable(sys.argv[2:]), "refresh": refresh, "disable": disable}[cmd]()
+
+
+if __name__ == "__main__":
+    main()

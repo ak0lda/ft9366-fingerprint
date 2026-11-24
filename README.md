@@ -25,6 +25,8 @@ sensor, and adds a small GNOME app to enroll fingers and choose where they can b
   - the lock screen
   - `sudo` / `su` in the terminal
   - polkit "Authentication required" dialogs
+- **Prompt icon** — `sudo` and other prompts show 🫆 before "Place your finger…",
+  so it is obvious the reader is waiting.
 - **Clean uninstall** — restores stock libfprint, PAM files and settings.
 
 > The app interface is currently in Russian. Translations are welcome.
@@ -56,7 +58,8 @@ Individual steps:
 | `sudo ./install.sh` | Everything: driver, gain tuning, app |
 | `sudo ./install.sh driver` | Build and install libfprint with the driver |
 | `sudo ./install.sh tune` | Re-tune the gain only |
-| `sudo ./install.sh app` | Install the app only |
+| `sudo ./install.sh app` | Install the app (and the prompt icon) |
+| `sudo ./install.sh icon` | Add only the 🫆 prompt icon |
 | `sudo ./install.sh uninstall` | Revert everything |
 
 ## How it works
@@ -116,6 +119,7 @@ If the patch no longer applies, the build stops and the installed version stays 
 | `ft9366-tune-dac` | Per-unit gain tuning |
 | `fingerprint-settings` | The Fingerprints app (Python, GTK 4, libadwaita) |
 | `fingerprint-settings-helper` | Privileged helper (run via `pkexec`) that edits PAM and GDM settings |
+| `fingerprint-prompt-icon` | Adds 🫆 to pam_fprintd prompts via a `ru_RU`/`en_US` translation override, refreshed after fprintd updates; the package's own files are not touched |
 | `org.local.fingerprint-settings.policy` | polkit action for the helper |
 | `org.local.FingerprintSettings.desktop` | App launcher |
 | `patches/ft9366-driver.patch` | FT9366 driver from [tattwamashi/libfprint-ft9366-pkg](https://github.com/tattwamashi/libfprint-ft9366-pkg) @ `9bdb018` |
